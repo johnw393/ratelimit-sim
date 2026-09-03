@@ -1,0 +1,12 @@
+[package]
+name = "ratelimit-sim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Replay timestamped requests through a token-bucket limiter and see what gets throttled"
+
+[[bin]]
+name = "ratelimit-sim"
+path = "src/main.rs"
+
+[dependencies]
