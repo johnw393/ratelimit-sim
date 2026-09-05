@@ -229,3 +229,65 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_full() {
+        let mut b = TokenBucket::new(5.0, 1.0);
+        assert_eq!(b.tokens, 5.0);
+        assert!(b.allow(0.0));
+        assert_eq!(b.tokens, 4.0);
+    }
+
+    #[test]
+    fn denies_once_drained() {
+        let mut b = TokenBucket::new(1.0, 1.0);
+        assert!(b.allow(0.0));
+        // No time has passed, so there's nothing to refill with.
+        assert!(!b.allow(0.0));
+    }
+
+    #[test]
+    fn refills_at_configured_rate() {
+        let mut b = TokenBucket::new(2.0, 1.0);
+        assert!(b.allow(0.0));
+        assert!(b.allow(0.0));
+        assert!(!b.allow(0.0));
+
+        // One second later, one token's worth of refill should be available.
+        assert!(b.allow(1.0));
+        assert!(!b.allow(1.0));
+    }
+
+    #[test]
+    fn refill_caps_at_capacity() {
+        let mut b = TokenBucket::new(2.0, 1.0);
+        assert!(b.allow(0.0));
+        // A huge gap should still only refill up to capacity, not beyond it.
+        assert!(b.allow(1000.0));
+        assert_eq!(b.tokens, 1.0);
+        assert!(b.allow(1000.0));
+        assert!(!b.allow(1000.0));
+    }
+
+    #[test]
+    fn out_of_order_timestamps_do_not_refill() {
+        let mut b = TokenBucket::new(1.0, 10.0);
+        assert!(b.allow(10.0));
+        // A timestamp earlier than the last one seen must not grant tokens
+        // for negative elapsed time.
+        assert!(!b.allow(5.0));
+    }
+
+    #[test]
+    fn fractional_tokens_accumulate_across_requests() {
+        let mut b = TokenBucket::new(1.0, 0.5);
+        assert!(b.allow(0.0));
+        assert!(!b.allow(1.0));
+        // Two more seconds brings us to exactly one full token.
+        assert!(b.allow(3.0));
+    }
+}
