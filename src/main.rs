@@ -8,7 +8,7 @@
 // seconds are fine). The key is optional and lets you simulate per-client
 // limits (e.g. one bucket per IP) instead of a single global bucket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -16,9 +16,28 @@ use std::process::ExitCode;
 
 const DEFAULT_KEY: &str = "_default";
 
+#[derive(Clone, Copy)]
+enum Algorithm {
+    TokenBucket,
+    SlidingWindow,
+    FixedWindow,
+}
+
+impl Algorithm {
+    fn parse(s: &str) -> Option<Algorithm> {
+        match s {
+            "token-bucket" => Some(Algorithm::TokenBucket),
+            "sliding-window" => Some(Algorithm::SlidingWindow),
+            "fixed-window" => Some(Algorithm::FixedWindow),
+            _ => None,
+        }
+    }
+}
+
 struct Config {
     rate: f64,
     burst: f64,
+    algorithm: Algorithm,
     files: Vec<String>,
     quiet: bool,
 }
@@ -62,6 +81,104 @@ impl TokenBucket {
     }
 }
 
+// Derives a (window length, request limit) pair from --rate/--burst so all
+// three algorithms answer the same question: "at most `burst` requests per
+// `burst / rate` seconds". That keeps the CLI flags meaningful regardless of
+// which algorithm is selected instead of needing separate flags per algorithm.
+fn window_params(rate: f64, burst: f64) -> (f64, usize) {
+    let limit = burst.round().max(1.0) as usize;
+    (burst / rate, limit)
+}
+
+// Sliding window log: keeps every allowed request's timestamp and counts how
+// many fall within the trailing window. Exact, but memory grows with the
+// number of allowed requests in a window.
+struct SlidingWindowLog {
+    window: f64,
+    limit: usize,
+    timestamps: VecDeque<f64>,
+}
+
+impl SlidingWindowLog {
+    fn new(rate: f64, burst: f64) -> Self {
+        let (window, limit) = window_params(rate, burst);
+        SlidingWindowLog { window, limit, timestamps: VecDeque::new() }
+    }
+
+    fn allow(&mut self, now: f64) -> bool {
+        while let Some(&oldest) = self.timestamps.front() {
+            if now - oldest > self.window {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.timestamps.len() < self.limit {
+            self.timestamps.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Fixed window counter: time is sliced into windows of fixed length aligned
+// to the epoch, and each window has its own independent request count. Cheap,
+// but allows up to 2x the limit across a window boundary.
+struct FixedWindowCounter {
+    window: f64,
+    limit: usize,
+    current_index: Option<i64>,
+    count: usize,
+}
+
+impl FixedWindowCounter {
+    fn new(rate: f64, burst: f64) -> Self {
+        let (window, limit) = window_params(rate, burst);
+        FixedWindowCounter { window, limit, current_index: None, count: 0 }
+    }
+
+    fn allow(&mut self, now: f64) -> bool {
+        let index = (now / self.window).floor() as i64;
+        if self.current_index != Some(index) {
+            self.current_index = Some(index);
+            self.count = 0;
+        }
+
+        if self.count < self.limit {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+enum Limiter {
+    TokenBucket(TokenBucket),
+    SlidingWindow(SlidingWindowLog),
+    FixedWindow(FixedWindowCounter),
+}
+
+impl Limiter {
+    fn new(algorithm: Algorithm, rate: f64, burst: f64) -> Self {
+        match algorithm {
+            Algorithm::TokenBucket => Limiter::TokenBucket(TokenBucket::new(burst, rate)),
+            Algorithm::SlidingWindow => Limiter::SlidingWindow(SlidingWindowLog::new(rate, burst)),
+            Algorithm::FixedWindow => Limiter::FixedWindow(FixedWindowCounter::new(rate, burst)),
+        }
+    }
+
+    fn allow(&mut self, now: f64) -> bool {
+        match self {
+            Limiter::TokenBucket(l) => l.allow(now),
+            Limiter::SlidingWindow(l) => l.allow(now),
+            Limiter::FixedWindow(l) => l.allow(now),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     total: u64,
@@ -73,6 +190,7 @@ struct Stats {
 fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut rate = None;
     let mut burst = None;
+    let mut algorithm = Algorithm::TokenBucket;
     let mut files = Vec::new();
     let mut quiet = false;
 
@@ -88,6 +206,16 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 i += 1;
                 let v = args.get(i).ok_or("--burst needs a value")?;
                 burst = Some(v.parse::<f64>().map_err(|_| format!("bad --burst value: {}", v))?);
+            }
+            "--algorithm" => {
+                i += 1;
+                let v = args.get(i).ok_or("--algorithm needs a value")?;
+                algorithm = Algorithm::parse(v).ok_or_else(|| {
+                    format!(
+                        "bad --algorithm value: {} (expected token-bucket, sliding-window, or fixed-window)",
+                        v
+                    )
+                })?;
             }
             "--quiet" => quiet = true,
             "-h" | "--help" => return Err(usage()),
@@ -106,7 +234,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("--burst must be greater than 0".to_string());
     }
 
-    Ok(Config { rate, burst, files, quiet })
+    Ok(Config { rate, burst, algorithm, files, quiet })
 }
 
 fn usage() -> String {
@@ -118,9 +246,10 @@ fn usage() -> String {
      With no FILE arguments, or when a FILE is \"-\", reads from stdin.\n\
      \n\
      options:\n\
-     \x20 --rate N    tokens (requests) added per second\n\
-     \x20 --burst N   bucket capacity (max requests in a burst)\n\
-     \x20 --quiet     suppress per-line output, print only the summary\n"
+     \x20 --rate N        tokens (requests) added per second\n\
+     \x20 --burst N       bucket capacity (max requests in a burst)\n\
+     \x20 --algorithm A   token-bucket (default), sliding-window, or fixed-window\n\
+     \x20 --quiet         suppress per-line output, print only the summary\n"
         .to_string()
 }
 
@@ -137,7 +266,7 @@ fn parse_line(line: &str) -> Option<(f64, &str)> {
 fn process<R: BufRead>(
     reader: R,
     config: &Config,
-    buckets: &mut HashMap<String, TokenBucket>,
+    buckets: &mut HashMap<String, Limiter>,
     stats: &mut Stats,
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -159,7 +288,7 @@ fn process<R: BufRead>(
 
         let bucket = buckets
             .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(config.burst, config.rate));
+            .or_insert_with(|| Limiter::new(config.algorithm, config.rate, config.burst));
 
         let allowed = bucket.allow(ts);
         stats.total += 1;
@@ -185,7 +314,7 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = parse_args(&args)?;
 
-    let mut buckets: HashMap<String, TokenBucket> = HashMap::new();
+    let mut buckets: HashMap<String, Limiter> = HashMap::new();
     let mut stats = Stats::default();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -289,5 +418,42 @@ mod tests {
         assert!(!b.allow(1.0));
         // Two more seconds brings us to exactly one full token.
         assert!(b.allow(3.0));
+    }
+
+    #[test]
+    fn sliding_window_denies_once_limit_hit_in_window() {
+        // rate=1, burst=2 -> window of 2s, limit of 2 requests.
+        let mut w = SlidingWindowLog::new(1.0, 2.0);
+        assert!(w.allow(0.0));
+        assert!(w.allow(1.0));
+        assert!(!w.allow(1.5));
+    }
+
+    #[test]
+    fn sliding_window_expires_old_requests() {
+        let mut w = SlidingWindowLog::new(1.0, 2.0);
+        assert!(w.allow(0.0));
+        assert!(w.allow(1.0));
+        // 2.1s later the request at t=0 has fallen out of the 2s window.
+        assert!(w.allow(2.1));
+    }
+
+    #[test]
+    fn fixed_window_resets_at_window_boundary() {
+        // rate=1, burst=2 -> window of 2s, limit of 2 requests.
+        let mut f = FixedWindowCounter::new(1.0, 2.0);
+        assert!(f.allow(0.0));
+        assert!(f.allow(1.0));
+        assert!(!f.allow(1.5));
+        // t=2.0 starts a new window (index 1), so the count resets.
+        assert!(f.allow(2.0));
+    }
+
+    #[test]
+    fn algorithm_parse_rejects_unknown_values() {
+        assert!(Algorithm::parse("token-bucket").is_some());
+        assert!(Algorithm::parse("sliding-window").is_some());
+        assert!(Algorithm::parse("fixed-window").is_some());
+        assert!(Algorithm::parse("leaky-bucket").is_none());
     }
 }

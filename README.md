@@ -66,14 +66,27 @@ $ ratelimit-sim --rate 5 --burst 10 --quiet requests.log
 total=4 allowed=3 denied=1 malformed=0 keys=2
 ```
 
-## Algorithm
+## Algorithms
 
-The limiter is a standard token bucket: each key starts with `--burst`
-tokens, gains `--rate` tokens per second, caps at `--burst`, and spends one
-token per allowed request. This is the same algorithm used by most
-production rate limiters (nginx's `limit_req`, AWS API Gateway, etc.), so
-the simulation should track what you'd see in production reasonably
-closely.
+`--algorithm` selects which limiter simulates the requests. All three read
+the same `--rate`/`--burst` pair; only how they use it differs.
+
+- `token-bucket` (default): each key starts with `--burst` tokens, gains
+  `--rate` tokens per second, caps at `--burst`, and spends one token per
+  allowed request. This is the same algorithm used by most production rate
+  limiters (nginx's `limit_req`, AWS API Gateway, etc.).
+- `sliding-window`: allows at most `--burst` requests in any trailing
+  `--burst / --rate` seconds, counted exactly from the timestamps of
+  previously allowed requests. More precise than a fixed window but costs
+  more memory per key.
+- `fixed-window`: like `sliding-window`, but the window is a fixed
+  `--burst / --rate` second slice aligned to the epoch instead of trailing
+  the current request. Cheaper, but a burst that straddles a window
+  boundary can let through close to twice `--burst` requests.
+
+```
+$ ratelimit-sim --rate 1 --burst 2 --algorithm sliding-window requests.log
+```
 
 ## Building
 
