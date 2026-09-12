@@ -34,10 +34,27 @@ impl Algorithm {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Format {
+    Text,
+    Json,
+}
+
+impl Format {
+    fn parse(s: &str) -> Option<Format> {
+        match s {
+            "text" => Some(Format::Text),
+            "json" => Some(Format::Json),
+            _ => None,
+        }
+    }
+}
+
 struct Config {
     rate: f64,
     burst: f64,
     algorithm: Algorithm,
+    format: Format,
     files: Vec<String>,
     quiet: bool,
 }
@@ -191,6 +208,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut rate = None;
     let mut burst = None;
     let mut algorithm = Algorithm::TokenBucket;
+    let mut format = Format::Text;
     let mut files = Vec::new();
     let mut quiet = false;
 
@@ -217,6 +235,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     )
                 })?;
             }
+            "--format" => {
+                i += 1;
+                let v = args.get(i).ok_or("--format needs a value")?;
+                format = Format::parse(v)
+                    .ok_or_else(|| format!("bad --format value: {} (expected text or json)", v))?;
+            }
             "--quiet" => quiet = true,
             "-h" | "--help" => return Err(usage()),
             other => files.push(other.to_string()),
@@ -234,7 +258,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("--burst must be greater than 0".to_string());
     }
 
-    Ok(Config { rate, burst, algorithm, files, quiet })
+    Ok(Config { rate, burst, algorithm, format, files, quiet })
 }
 
 fn usage() -> String {
@@ -249,6 +273,7 @@ fn usage() -> String {
      \x20 --rate N        tokens (requests) added per second\n\
      \x20 --burst N       bucket capacity (max requests in a burst)\n\
      \x20 --algorithm A   token-bucket (default), sliding-window, or fixed-window\n\
+     \x20 --format F      text (default) or json for per-line output\n\
      \x20 --quiet         suppress per-line output, print only the summary\n"
         .to_string()
 }
@@ -259,6 +284,9 @@ fn parse_line(line: &str) -> Option<(f64, &str)> {
     let mut parts = line.split_whitespace();
     let ts_str = parts.next()?;
     let ts = ts_str.parse::<f64>().ok()?;
+    if !ts.is_finite() {
+        return None;
+    }
     let key = parts.next().unwrap_or(DEFAULT_KEY);
     Some((ts, key))
 }
@@ -299,8 +327,22 @@ fn process<R: BufRead>(
         }
 
         if !config.quiet {
-            let verdict = if allowed { "ALLOW" } else { "DENY" };
-            writeln!(out, "{} {} {}", verdict, ts_display(ts), key)?;
+            match config.format {
+                Format::Text => {
+                    let verdict = if allowed { "ALLOW" } else { "DENY" };
+                    writeln!(out, "{} {} {}", verdict, ts_display(ts), key)?;
+                }
+                Format::Json => {
+                    let verdict = if allowed { "allow" } else { "deny" };
+                    writeln!(
+                        out,
+                        "{{\"verdict\":\"{}\",\"timestamp\":{},\"key\":\"{}\"}}",
+                        verdict,
+                        ts,
+                        json_escape(key)
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -308,6 +350,25 @@ fn process<R: BufRead>(
 
 fn ts_display(ts: f64) -> String {
     format!("{:.3}", ts)
+}
+
+// Escapes a string for use inside a JSON string literal. Keys come straight
+// from input lines, so they may contain quotes, backslashes, or control
+// characters that would otherwise produce invalid JSON.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn run() -> Result<(), String> {
@@ -455,5 +516,28 @@ mod tests {
         assert!(Algorithm::parse("sliding-window").is_some());
         assert!(Algorithm::parse("fixed-window").is_some());
         assert!(Algorithm::parse("leaky-bucket").is_none());
+    }
+
+    #[test]
+    fn format_parse_rejects_unknown_values() {
+        assert!(Format::parse("text").is_some());
+        assert!(Format::parse("json").is_some());
+        assert!(Format::parse("yaml").is_none());
+    }
+
+    #[test]
+    fn parse_line_rejects_non_finite_timestamps() {
+        assert!(parse_line("inf").is_none());
+        assert!(parse_line("nan").is_none());
+        assert!(parse_line("-infinity 10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_and_control_chars() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\u{1}b"), "a\\u0001b");
     }
 }

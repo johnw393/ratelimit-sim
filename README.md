@@ -66,6 +66,18 @@ $ ratelimit-sim --rate 5 --burst 10 --quiet requests.log
 total=4 allowed=3 denied=1 malformed=0 keys=2
 ```
 
+Use `--format json` to get one JSON object per line instead, for feeding
+into another tool:
+
+```
+$ ratelimit-sim --rate 2 --burst 2 --format json requests.log
+{"verdict":"allow","timestamp":1690000000,"key":"10.0.0.1"}
+{"verdict":"allow","timestamp":1690000000.2,"key":"10.0.0.1"}
+{"verdict":"deny","timestamp":1690000000.4,"key":"10.0.0.1"}
+{"verdict":"allow","timestamp":1690000000.6,"key":"10.0.0.2"}
+total=4 allowed=3 denied=1 malformed=0 keys=2
+```
+
 ## Algorithms
 
 `--algorithm` selects which limiter simulates the requests. All three read
