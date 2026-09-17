@@ -51,6 +51,16 @@ ALLOW 1690000000.600 10.0.0.2
 total=4 allowed=3 denied=1 malformed=0 keys=2
 ```
 
+Add `--per-key` to break the summary down by key instead of only seeing the
+total across every bucket:
+
+```
+$ ratelimit-sim --rate 2 --burst 2 --per-key --quiet requests.log
+total=4 allowed=3 denied=1 malformed=0 keys=2
+  10.0.0.1: total=3 allowed=2 denied=1
+  10.0.0.2: total=1 allowed=1 denied=0
+```
+
 Mix stdin with files by using `-` as a filename:
 
 ```

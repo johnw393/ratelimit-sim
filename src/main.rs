@@ -57,6 +57,7 @@ struct Config {
     format: Format,
     files: Vec<String>,
     quiet: bool,
+    per_key: bool,
 }
 
 // Classic token bucket: tokens refill continuously at `rate` per second, up
@@ -197,11 +198,24 @@ impl Limiter {
 }
 
 #[derive(Default)]
-struct Stats {
+struct KeyStats {
     total: u64,
     allowed: u64,
     denied: u64,
+}
+
+#[derive(Default)]
+struct Stats {
     malformed: u64,
+    per_key: HashMap<String, KeyStats>,
+}
+
+impl Stats {
+    fn totals(&self) -> (u64, u64, u64) {
+        self.per_key.values().fold((0, 0, 0), |(total, allowed, denied), k| {
+            (total + k.total, allowed + k.allowed, denied + k.denied)
+        })
+    }
 }
 
 fn parse_args(args: &[String]) -> Result<Config, String> {
@@ -211,6 +225,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut format = Format::Text;
     let mut files = Vec::new();
     let mut quiet = false;
+    let mut per_key = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -242,6 +257,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     .ok_or_else(|| format!("bad --format value: {} (expected text or json)", v))?;
             }
             "--quiet" => quiet = true,
+            "--per-key" => per_key = true,
             "-h" | "--help" => return Err(usage()),
             other => files.push(other.to_string()),
         }
@@ -258,7 +274,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("--burst must be greater than 0".to_string());
     }
 
-    Ok(Config { rate, burst, algorithm, format, files, quiet })
+    Ok(Config { rate, burst, algorithm, format, files, quiet, per_key })
 }
 
 fn usage() -> String {
@@ -274,7 +290,8 @@ fn usage() -> String {
      \x20 --burst N       bucket capacity (max requests in a burst)\n\
      \x20 --algorithm A   token-bucket (default), sliding-window, or fixed-window\n\
      \x20 --format F      text (default) or json for per-line output\n\
-     \x20 --quiet         suppress per-line output, print only the summary\n"
+     \x20 --quiet         suppress per-line output, print only the summary\n\
+     \x20 --per-key       print a summary line per key, not just the total\n"
         .to_string()
 }
 
@@ -319,11 +336,12 @@ fn process<R: BufRead>(
             .or_insert_with(|| Limiter::new(config.algorithm, config.rate, config.burst));
 
         let allowed = bucket.allow(ts);
-        stats.total += 1;
+        let key_stats = stats.per_key.entry(key.to_string()).or_default();
+        key_stats.total += 1;
         if allowed {
-            stats.allowed += 1;
+            key_stats.allowed += 1;
         } else {
-            stats.denied += 1;
+            key_stats.denied += 1;
         }
 
         if !config.quiet {
@@ -398,14 +416,24 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let (total, allowed, denied) = stats.totals();
     eprintln!(
         "total={} allowed={} denied={} malformed={} keys={}",
-        stats.total,
-        stats.allowed,
-        stats.denied,
+        total,
+        allowed,
+        denied,
         stats.malformed,
         buckets.len()
     );
+
+    if config.per_key {
+        let mut keys: Vec<&String> = stats.per_key.keys().collect();
+        keys.sort();
+        for key in keys {
+            let k = &stats.per_key[key];
+            eprintln!("  {}: total={} allowed={} denied={}", key, k.total, k.allowed, k.denied);
+        }
+    }
 
     Ok(())
 }
@@ -530,6 +558,53 @@ mod tests {
         assert!(parse_line("inf").is_none());
         assert!(parse_line("nan").is_none());
         assert!(parse_line("-infinity 10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn per_key_stats_tracked_independently() {
+        let config = Config {
+            rate: 1.0,
+            burst: 1.0,
+            algorithm: Algorithm::TokenBucket,
+            format: Format::Text,
+            files: Vec::new(),
+            quiet: true,
+            per_key: true,
+        };
+        let mut buckets = HashMap::new();
+        let mut stats = Stats::default();
+        let mut out = Vec::new();
+
+        let input = "0.0 a\n0.0 a\n0.0 b\n";
+        process(io::Cursor::new(input.as_bytes()), &config, &mut buckets, &mut stats, &mut out).unwrap();
+
+        let a = &stats.per_key["a"];
+        assert_eq!((a.total, a.allowed, a.denied), (2, 1, 1));
+        let b = &stats.per_key["b"];
+        assert_eq!((b.total, b.allowed, b.denied), (1, 1, 0));
+        assert_eq!(stats.totals(), (3, 2, 1));
+    }
+
+    #[test]
+    fn malformed_lines_do_not_count_toward_any_key() {
+        let config = Config {
+            rate: 1.0,
+            burst: 1.0,
+            algorithm: Algorithm::TokenBucket,
+            format: Format::Text,
+            files: Vec::new(),
+            quiet: true,
+            per_key: false,
+        };
+        let mut buckets = HashMap::new();
+        let mut stats = Stats::default();
+        let mut out = Vec::new();
+
+        let input = "not-a-timestamp\n0.0 a\n";
+        process(io::Cursor::new(input.as_bytes()), &config, &mut buckets, &mut stats, &mut out).unwrap();
+
+        assert_eq!(stats.malformed, 1);
+        assert_eq!(stats.totals(), (1, 1, 0));
     }
 
     #[test]
