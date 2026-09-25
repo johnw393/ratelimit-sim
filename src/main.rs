@@ -1,12 +1,15 @@
 // ratelimit-sim: replay a log of timestamped requests through a token-bucket
 // limiter and report which requests would have been allowed or throttled.
 //
-// Input lines look like:
+// Input lines look like either:
 //   <unix-timestamp> [key]
+// or an Apache/nginx common/combined log format line, e.g.:
+//   127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /x HTTP/1.0" 200 2326
 //
 // The timestamp is a float number of seconds since the epoch (fractional
 // seconds are fine). The key is optional and lets you simulate per-client
-// limits (e.g. one bucket per IP) instead of a single global bucket.
+// limits (e.g. one bucket per IP) instead of a single global bucket; for
+// access log lines the leading host is used as the key.
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -295,9 +298,15 @@ fn usage() -> String {
         .to_string()
 }
 
-// Parses a line into (timestamp, key). Lines with no key use DEFAULT_KEY so
-// all requests share one global bucket.
+// Parses a line into (timestamp, key). Tries the plain "timestamp [key]"
+// format first, then falls back to Apache/nginx common/combined log format
+// so access logs can be fed in directly without a pre-extraction pass.
 fn parse_line(line: &str) -> Option<(f64, &str)> {
+    parse_raw_line(line).or_else(|| parse_access_log_line(line))
+}
+
+// Lines with no key use DEFAULT_KEY so all requests share one global bucket.
+fn parse_raw_line(line: &str) -> Option<(f64, &str)> {
     let mut parts = line.split_whitespace();
     let ts_str = parts.next()?;
     let ts = ts_str.parse::<f64>().ok()?;
@@ -306,6 +315,82 @@ fn parse_line(line: &str) -> Option<(f64, &str)> {
     }
     let key = parts.next().unwrap_or(DEFAULT_KEY);
     Some((ts, key))
+}
+
+// Parses a Common/Combined Log Format line, e.g.:
+//   127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /x HTTP/1.0" 200 2326
+// The leading host token becomes the key, so per-IP bucketing falls out for
+// free without needing a separate --key-field flag.
+fn parse_access_log_line(line: &str) -> Option<(f64, &str)> {
+    let host = line.split_whitespace().next()?;
+    let start = line.find('[')?;
+    let end = start + line[start..].find(']')?;
+    let ts = parse_clf_timestamp(&line[start + 1..end])?;
+    Some((ts, host))
+}
+
+const CLF_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn month_index(s: &str) -> Option<i64> {
+    CLF_MONTHS.iter().position(|&m| m == s).map(|i| i as i64 + 1)
+}
+
+// Days since 1970-01-01 for a given proleptic Gregorian calendar date.
+// https://howardhinnant.github.io/date_algorithms.html#days_from_civil
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+// Parses the bracketed timestamp of a CLF/combined log line, e.g.
+// "10/Oct/2000:13:55:36 -0700", into seconds since the epoch (UTC).
+fn parse_clf_timestamp(s: &str) -> Option<f64> {
+    let mut top = s.splitn(2, ' ');
+    let date_time = top.next()?;
+    let tz = top.next()?;
+
+    let mut dt = date_time.splitn(2, ':');
+    let date_str = dt.next()?;
+    let time_str = dt.next()?;
+
+    let mut date_fields = date_str.splitn(3, '/');
+    let day: i64 = date_fields.next()?.parse().ok()?;
+    let month = month_index(date_fields.next()?)?;
+    let year: i64 = date_fields.next()?.parse().ok()?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut time_fields = time_str.splitn(3, ':');
+    let hour: i64 = time_fields.next()?.parse().ok()?;
+    let min: i64 = time_fields.next()?.parse().ok()?;
+    let sec: f64 = time_fields.next()?.parse().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&min) || !(0.0..60.0).contains(&sec) {
+        return None;
+    }
+
+    if tz.len() != 5 {
+        return None;
+    }
+    let tz_sign = match tz.as_bytes()[0] {
+        b'+' => 1i64,
+        b'-' => -1i64,
+        _ => return None,
+    };
+    let tz_hh: i64 = tz[1..3].parse().ok()?;
+    let tz_mm: i64 = tz[3..5].parse().ok()?;
+    let tz_offset = tz_sign * (tz_hh * 3600 + tz_mm * 60);
+
+    let days = days_from_civil(year, month, day);
+    let local_secs = (days * 86400 + hour * 3600 + min * 60) as f64 + sec;
+    Some(local_secs - tz_offset as f64)
 }
 
 fn process<R: BufRead>(
@@ -558,6 +643,51 @@ mod tests {
         assert!(parse_line("inf").is_none());
         assert!(parse_line("nan").is_none());
         assert!(parse_line("-infinity 10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_reference_points() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        // 30 years including 7 leap years (72, 76, 80, 84, 88, 92, 96).
+        assert_eq!(days_from_civil(2000, 1, 1), 10957);
+    }
+
+    #[test]
+    fn parse_clf_timestamp_handles_utc() {
+        let ts = parse_clf_timestamp("01/Jan/2000:00:00:00 +0000").unwrap();
+        assert_eq!(ts, 946684800.0);
+    }
+
+    #[test]
+    fn parse_clf_timestamp_applies_offset() {
+        // -0500 means local time is 5 hours behind UTC, so UTC is later.
+        let ts = parse_clf_timestamp("01/Jan/2000:00:00:00 -0500").unwrap();
+        assert_eq!(ts, 946684800.0 + 5.0 * 3600.0);
+    }
+
+    #[test]
+    fn parse_clf_timestamp_rejects_bad_fields() {
+        assert!(parse_clf_timestamp("32/Oct/2000:13:55:36 -0700").is_none());
+        assert!(parse_clf_timestamp("10/Foo/2000:13:55:36 -0700").is_none());
+        assert!(parse_clf_timestamp("10/Oct/2000:25:55:36 -0700").is_none());
+        assert!(parse_clf_timestamp("10/Oct/2000:13:55:36 700").is_none());
+    }
+
+    #[test]
+    fn parse_access_log_line_extracts_host_and_timestamp() {
+        let line = r#"127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /x HTTP/1.0" 200 2326"#;
+        let (ts, key) = parse_access_log_line(line).unwrap();
+        assert_eq!(key, "127.0.0.1");
+        assert_eq!(ts, parse_clf_timestamp("10/Oct/2000:13:55:36 -0700").unwrap());
+    }
+
+    #[test]
+    fn parse_line_falls_back_to_access_log_format() {
+        let line = r#"10.0.0.5 - - [01/Jan/2000:00:00:00 +0000] "GET / HTTP/1.1" 200 10"#;
+        let (ts, key) = parse_line(line).unwrap();
+        assert_eq!(ts, 946684800.0);
+        assert_eq!(key, "10.0.0.5");
     }
 
     #[test]

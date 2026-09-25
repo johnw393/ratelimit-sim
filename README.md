@@ -8,7 +8,9 @@ request timestamps through a token-bucket simulation instead, so you can see
 how many requests a candidate `--rate`/`--burst` pair would have rejected
 before it's live anywhere.
 
-Input is plain text, one request per line:
+Input is plain text, one request per line, in either of two formats.
+
+Pre-extracted timestamps:
 
 ```
 <unix-timestamp> [key]
@@ -18,6 +20,18 @@ The timestamp is seconds since the epoch (fractional seconds are fine). The
 optional key groups requests into separate buckets, so you can simulate a
 per-IP or per-API-key limit instead of one global one. Lines with no key
 share a single default bucket.
+
+Or Apache/nginx common/combined log format lines, straight from an access
+log with no pre-processing:
+
+```
+127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326
+```
+
+The bracketed timestamp is parsed and converted to seconds since the epoch,
+and the leading host becomes the key, so per-IP buckets fall out for free.
+Each line is tried against the timestamp-first format before falling back to
+the access log format.
 
 ## Usage
 
