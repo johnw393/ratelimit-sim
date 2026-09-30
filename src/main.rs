@@ -61,6 +61,20 @@ struct Config {
     files: Vec<String>,
     quiet: bool,
     per_key: bool,
+    from: Option<f64>,
+    to: Option<f64>,
+}
+
+impl Config {
+    fn has_time_filter(&self) -> bool {
+        self.from.is_some() || self.to.is_some()
+    }
+
+    // --from is inclusive and --to is exclusive, so adjacent ranges such as
+    // "--to 100" and "--from 100" split a log without overlap or gaps.
+    fn in_range(&self, ts: f64) -> bool {
+        self.from.map_or(true, |f| ts >= f) && self.to.map_or(true, |t| ts < t)
+    }
 }
 
 // Classic token bucket: tokens refill continuously at `rate` per second, up
@@ -210,6 +224,7 @@ struct KeyStats {
 #[derive(Default)]
 struct Stats {
     malformed: u64,
+    filtered: u64,
     per_key: HashMap<String, KeyStats>,
 }
 
@@ -229,6 +244,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut files = Vec::new();
     let mut quiet = false;
     let mut per_key = false;
+    let mut from = None;
+    let mut to = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -259,6 +276,16 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 format = Format::parse(v)
                     .ok_or_else(|| format!("bad --format value: {} (expected text or json)", v))?;
             }
+            "--from" => {
+                i += 1;
+                let v = args.get(i).ok_or("--from needs a value")?;
+                from = Some(parse_bound(v).ok_or_else(|| format!("bad --from value: {}", v))?);
+            }
+            "--to" => {
+                i += 1;
+                let v = args.get(i).ok_or("--to needs a value")?;
+                to = Some(parse_bound(v).ok_or_else(|| format!("bad --to value: {}", v))?);
+            }
             "--quiet" => quiet = true,
             "--per-key" => per_key = true,
             "-h" | "--help" => return Err(usage()),
@@ -277,7 +304,17 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("--burst must be greater than 0".to_string());
     }
 
-    Ok(Config { rate, burst, algorithm, format, files, quiet, per_key })
+    if let (Some(f), Some(t)) = (from, to) {
+        if f >= t {
+            return Err("--from must be less than --to".to_string());
+        }
+    }
+
+    Ok(Config { rate, burst, algorithm, format, files, quiet, per_key, from, to })
+}
+
+fn parse_bound(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 fn usage() -> String {
@@ -293,6 +330,8 @@ fn usage() -> String {
      \x20 --burst N       bucket capacity (max requests in a burst)\n\
      \x20 --algorithm A   token-bucket (default), sliding-window, or fixed-window\n\
      \x20 --format F      text (default) or json for per-line output\n\
+     \x20 --from T        ignore requests before unix time T (inclusive bound)\n\
+     \x20 --to T          ignore requests at or after unix time T\n\
      \x20 --quiet         suppress per-line output, print only the summary\n\
      \x20 --per-key       print a summary line per key, not just the total\n"
         .to_string()
@@ -416,6 +455,13 @@ fn process<R: BufRead>(
             }
         };
 
+        // Filtered lines never reach a limiter, so they don't drain tokens or
+        // create buckets for keys that only appear outside the range.
+        if !config.in_range(ts) {
+            stats.filtered += 1;
+            continue;
+        }
+
         let bucket = buckets
             .entry(key.to_string())
             .or_insert_with(|| Limiter::new(config.algorithm, config.rate, config.burst));
@@ -502,13 +548,19 @@ fn run() -> Result<(), String> {
     }
 
     let (total, allowed, denied) = stats.totals();
+    let filtered = if config.has_time_filter() {
+        format!(" filtered={}", stats.filtered)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "total={} allowed={} denied={} malformed={} keys={}",
+        "total={} allowed={} denied={} malformed={} keys={}{}",
         total,
         allowed,
         denied,
         stats.malformed,
-        buckets.len()
+        buckets.len(),
+        filtered
     );
 
     if config.per_key {
@@ -700,6 +752,8 @@ mod tests {
             files: Vec::new(),
             quiet: true,
             per_key: true,
+            from: None,
+            to: None,
         };
         let mut buckets = HashMap::new();
         let mut stats = Stats::default();
@@ -725,6 +779,8 @@ mod tests {
             files: Vec::new(),
             quiet: true,
             per_key: false,
+            from: None,
+            to: None,
         };
         let mut buckets = HashMap::new();
         let mut stats = Stats::default();
@@ -735,6 +791,60 @@ mod tests {
 
         assert_eq!(stats.malformed, 1);
         assert_eq!(stats.totals(), (1, 1, 0));
+    }
+
+    fn filter_config(from: Option<f64>, to: Option<f64>) -> Config {
+        Config {
+            rate: 1.0,
+            burst: 1.0,
+            algorithm: Algorithm::TokenBucket,
+            format: Format::Text,
+            files: Vec::new(),
+            quiet: true,
+            per_key: false,
+            from,
+            to,
+        }
+    }
+
+    #[test]
+    fn in_range_is_inclusive_of_from_and_exclusive_of_to() {
+        let c = filter_config(Some(10.0), Some(20.0));
+        assert!(!c.in_range(9.9));
+        assert!(c.in_range(10.0));
+        assert!(c.in_range(19.9));
+        assert!(!c.in_range(20.0));
+        assert!(filter_config(None, None).in_range(-5.0));
+    }
+
+    #[test]
+    fn filtered_lines_do_not_touch_limiter_state() {
+        let config = filter_config(Some(10.0), Some(20.0));
+        let mut buckets = HashMap::new();
+        let mut stats = Stats::default();
+        let mut out = Vec::new();
+
+        // The two requests at t=0 would drain the bucket if they were
+        // counted; the one at t=30 is past --to and only creates key "c".
+        let input = "0.0 a\n0.0 a\n10.0 a\n30.0 c\n";
+        process(io::Cursor::new(input.as_bytes()), &config, &mut buckets, &mut stats, &mut out).unwrap();
+
+        assert_eq!(stats.filtered, 3);
+        assert_eq!(stats.totals(), (1, 1, 0));
+        assert!(!buckets.contains_key("c"));
+    }
+
+    #[test]
+    fn parse_args_validates_time_bounds() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = ["--rate", "1", "--burst", "1"];
+
+        let ok = parse_args(&args(&[&base[..], &["--from", "5", "--to", "10"]].concat())).unwrap();
+        assert_eq!((ok.from, ok.to), (Some(5.0), Some(10.0)));
+
+        assert!(parse_args(&args(&[&base[..], &["--from", "10", "--to", "5"]].concat())).is_err());
+        assert!(parse_args(&args(&[&base[..], &["--from", "abc"]].concat())).is_err());
+        assert!(parse_args(&args(&[&base[..], &["--to", "inf"]].concat())).is_err());
     }
 
     #[test]

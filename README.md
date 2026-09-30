@@ -102,6 +102,17 @@ $ ratelimit-sim --rate 2 --burst 2 --format json requests.log
 total=4 allowed=3 denied=1 malformed=0 keys=2
 ```
 
+Use `--from` and `--to` (unix timestamps, fractional seconds allowed) to
+replay only a slice of a large log. `--from` is inclusive and `--to` is
+exclusive. Requests outside the range are skipped before they reach any
+limiter, so they don't consume tokens, and the summary gains a `filtered`
+count so you can see how many lines were left out:
+
+```
+$ ratelimit-sim --rate 2 --burst 2 --from 1690000000.3 --quiet requests.log
+total=2 allowed=2 denied=0 malformed=0 keys=2 filtered=2
+```
+
 ## Algorithms
 
 `--algorithm` selects which limiter simulates the requests. All three read
